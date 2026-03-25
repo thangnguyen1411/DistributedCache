@@ -2,6 +2,7 @@ package com.lld.cache.node;
 
 import com.lld.cache.eviction.EvictionPolicy;
 import com.lld.cache.event.CacheEventBus;
+import com.lld.cache.exception.CacheFullException;
 import com.lld.cache.expiration.LazyExpirationChecker;
 import com.lld.cache.model.CacheEntry;
 import com.lld.cache.model.CacheEvent;
@@ -224,6 +225,8 @@ public class CacheNodeImpl<K, V> implements CacheNode<K, V> {
         if (victim.isPresent()) {
             store.remove(victim.get());
             publishEvent(CacheEventType.EVICTION, victim.get());
+        } else {
+            throw new CacheFullException(nodeId);
         }
     }
 

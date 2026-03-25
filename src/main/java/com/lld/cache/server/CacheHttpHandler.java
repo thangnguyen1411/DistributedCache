@@ -1,6 +1,8 @@
 package com.lld.cache.server;
 
 import com.lld.cache.DistributedCache;
+import com.lld.cache.exception.CacheFullException;
+import com.lld.cache.exception.KeyNotFoundException;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
@@ -41,6 +43,10 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
         FullHttpResponse response;
         try {
             response = route(method, path, body);
+        } catch (KeyNotFoundException e) {
+            response = json(HttpResponseStatus.NOT_FOUND, jsonError(e.getMessage()));
+        } catch (CacheFullException e) {
+            response = json(HttpResponseStatus.INSUFFICIENT_STORAGE, jsonError(e.getMessage()));
         } catch (Exception e) {
             response = json(HttpResponseStatus.INTERNAL_SERVER_ERROR, jsonError(e.getMessage()));
         }
@@ -98,12 +104,9 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
 
     private FullHttpResponse handleGet(String key) {
         Optional<String> val = cache.get(key);
-        if (val.isPresent()) {
-            return json(HttpResponseStatus.OK,
-                    String.format("{\"key\":%s,\"value\":%s}", js(key), js(val.get())));
-        }
-        return json(HttpResponseStatus.NOT_FOUND,
-                String.format("{\"error\":\"Key not found\",\"key\":%s}", js(key)));
+        if (val.isEmpty()) throw new KeyNotFoundException(key);
+        return json(HttpResponseStatus.OK,
+                String.format("{\"key\":%s,\"value\":%s}", js(key), js(val.get())));
     }
 
     private FullHttpResponse handlePut(String body) {
@@ -126,13 +129,9 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
     }
 
     private FullHttpResponse handleDelete(String key) {
-        boolean deleted = cache.delete(key);
-        if (deleted) {
-            return json(HttpResponseStatus.OK,
-                    String.format("{\"status\":\"deleted\",\"key\":%s}", js(key)));
-        }
-        return json(HttpResponseStatus.NOT_FOUND,
-                String.format("{\"error\":\"Key not found\",\"key\":%s}", js(key)));
+        if (!cache.delete(key)) throw new KeyNotFoundException(key);
+        return json(HttpResponseStatus.OK,
+                String.format("{\"status\":\"deleted\",\"key\":%s}", js(key)));
     }
 
     private FullHttpResponse handleExists(String key) {
