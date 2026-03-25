@@ -1,8 +1,10 @@
 package com.lld.cache.server;
 
 import com.lld.cache.DistributedCache;
+import com.lld.cache.config.ServerRole;
 import com.lld.cache.exception.CacheFullException;
 import com.lld.cache.exception.KeyNotFoundException;
+import com.lld.cache.replication.PrimaryReplicationPublisher;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
@@ -24,21 +26,37 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Netty channel handler — routes incoming HTTP requests to cache operations.
+ * Netty channel handler — routes HTTP requests to cache operations.
+ *
+ * Role behaviour:
+ *   PRIMARY — accepts reads + writes; replicates writes to replicas via PrimaryReplicationPublisher
+ *   REPLICA — accepts reads only; rejects writes with 405; receives replication on /internal/replicate
  */
 public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpRequest> {
 
     private final DistributedCache<String, String> cache;
+    private final ServerRole role;
+    private final long defaultTtlSeconds;
+    private final PrimaryReplicationPublisher publisher;      // null on REPLICA
+    private final InternalReplicationHandler internalHandler; // used on REPLICA
 
-    public CacheHttpHandler(DistributedCache<String, String> cache) {
+    public CacheHttpHandler(DistributedCache<String, String> cache,
+                            ServerRole role,
+                            long defaultTtlSeconds,
+                            PrimaryReplicationPublisher publisher,
+                            InternalReplicationHandler internalHandler) {
         this.cache = cache;
+        this.role = role;
+        this.defaultTtlSeconds = defaultTtlSeconds;
+        this.publisher = publisher;
+        this.internalHandler = internalHandler;
     }
 
     @Override
     protected void channelRead0(ChannelHandlerContext ctx, FullHttpRequest req) {
-        String path   = req.uri();
+        String path       = req.uri();
         HttpMethod method = req.method();
-        String body   = req.content().toString(StandardCharsets.UTF_8);
+        String body       = req.content().toString(StandardCharsets.UTF_8);
 
         FullHttpResponse response;
         try {
@@ -51,7 +69,6 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
             response = json(HttpResponseStatus.INTERNAL_SERVER_ERROR, jsonError(e.getMessage()));
         }
 
-        // Close connection after response (HTTP/1.0 style — keeps things simple)
         response.headers().set(HttpHeaderNames.CONNECTION, HttpHeaderValues.CLOSE);
         ctx.writeAndFlush(response).addListener(ChannelFutureListener.CLOSE);
     }
@@ -60,17 +77,21 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
 
     private FullHttpResponse route(HttpMethod method, String path, String body) {
 
-        // GET /health
+        // Internal replication endpoint — always accessible regardless of role
+        if (POST(method) && path.equals("/internal/replicate")) {
+            return internalHandler.handle(body, this::json);
+        }
+
+        // Health
         if (GET(method) && path.equals("/health")) {
             return handleHealth();
         }
 
-        // GET /nodes
+        // Nodes
         if (GET(method) && path.equals("/nodes")) {
             return handleListNodes();
         }
 
-        // POST /nodes/{nodeId}
         Matcher m = match("/nodes/(.+)", path);
         if (m.matches()) {
             String nodeId = m.group(1);
@@ -78,13 +99,13 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
             if (DELETE(method)) return handleRemoveNode(nodeId);
         }
 
-        // GET /cache/{key}/exists
+        // Cache — exists check
         m = match("/cache/(.+)/exists", path);
         if (m.matches()) {
             return handleExists(m.group(1));
         }
 
-        // GET|DELETE /cache/{key}
+        // Cache — key operations
         m = match("/cache/(.+)", path);
         if (m.matches()) {
             String key = m.group(1);
@@ -92,7 +113,7 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
             if (DELETE(method)) return handleDelete(key);
         }
 
-        // POST /cache
+        // Cache — put
         if (POST(method) && path.equals("/cache")) {
             return handlePut(body);
         }
@@ -110,6 +131,10 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
     }
 
     private FullHttpResponse handlePut(String body) {
+        if (role == ServerRole.REPLICA) {
+            return replicaWriteRejected();
+        }
+
         String key    = extractField(body, "key");
         String value  = extractField(body, "value");
         String ttlStr = extractField(body, "ttl");
@@ -119,25 +144,35 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
                     "{\"error\":\"Request body must contain 'key' and 'value'\"}");
         }
 
-        if (ttlStr != null) {
-            cache.put(key, value, Duration.ofSeconds(Long.parseLong(ttlStr)));
-        } else {
-            cache.put(key, value);
+        long ttlSeconds = ttlStr != null ? Long.parseLong(ttlStr) : defaultTtlSeconds;
+        cache.put(key, value, Duration.ofSeconds(ttlSeconds));
+
+        if (publisher != null) {
+            publisher.replicatePut(key, value, ttlSeconds);
         }
+
         return json(HttpResponseStatus.OK,
                 String.format("{\"status\":\"OK\",\"key\":%s}", js(key)));
     }
 
     private FullHttpResponse handleDelete(String key) {
+        if (role == ServerRole.REPLICA) {
+            return replicaWriteRejected();
+        }
+
         if (!cache.delete(key)) throw new KeyNotFoundException(key);
+
+        if (publisher != null) {
+            publisher.replicateDelete(key);
+        }
+
         return json(HttpResponseStatus.OK,
                 String.format("{\"status\":\"deleted\",\"key\":%s}", js(key)));
     }
 
     private FullHttpResponse handleExists(String key) {
-        boolean exists = cache.exists(key);
         return json(HttpResponseStatus.OK,
-                String.format("{\"key\":%s,\"exists\":%b}", js(key), exists));
+                String.format("{\"key\":%s,\"exists\":%b}", js(key), cache.exists(key)));
     }
 
     private FullHttpResponse handleListNodes() {
@@ -147,28 +182,38 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
     }
 
     private FullHttpResponse handleAddNode(String nodeId) {
+        if (role == ServerRole.REPLICA) return replicaWriteRejected();
         cache.addNode(nodeId);
         List<String> ids = cache.getNodeIds();
         return json(HttpResponseStatus.OK,
-                String.format("{\"status\":\"added\",\"nodeId\":%s,\"nodes\":%s}", js(nodeId), jsArray(ids)));
+                String.format("{\"status\":\"added\",\"nodeId\":%s,\"nodes\":%s}",
+                        js(nodeId), jsArray(ids)));
     }
 
     private FullHttpResponse handleRemoveNode(String nodeId) {
+        if (role == ServerRole.REPLICA) return replicaWriteRejected();
         cache.removeNode(nodeId);
         List<String> ids = cache.getNodeIds();
         return json(HttpResponseStatus.OK,
-                String.format("{\"status\":\"removed\",\"nodeId\":%s,\"nodes\":%s}", js(nodeId), jsArray(ids)));
+                String.format("{\"status\":\"removed\",\"nodeId\":%s,\"nodes\":%s}",
+                        js(nodeId), jsArray(ids)));
     }
 
     private FullHttpResponse handleHealth() {
-        int count = cache.getNodeIds().size();
+        List<String> nodes = cache.getNodeIds();
         return json(HttpResponseStatus.OK,
-                String.format("{\"status\":\"UP\",\"nodes\":%d}", count));
+                String.format("{\"status\":\"UP\",\"role\":\"%s\",\"nodes\":%d}",
+                        role.name(), nodes.size()));
+    }
+
+    private FullHttpResponse replicaWriteRejected() {
+        return json(HttpResponseStatus.METHOD_NOT_ALLOWED,
+                "{\"error\":\"REPLICA is read-only. Send writes to the PRIMARY.\"}");
     }
 
     // ─── helpers ────────────────────────────────────────────────────────────
 
-    private FullHttpResponse json(HttpResponseStatus status, String body) {
+    FullHttpResponse json(HttpResponseStatus status, String body) {
         byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
         FullHttpResponse resp = new DefaultFullHttpResponse(
                 HttpVersion.HTTP_1_1, status, Unpooled.wrappedBuffer(bytes));
@@ -186,7 +231,6 @@ public class CacheHttpHandler extends SimpleChannelInboundHandler<FullHttpReques
         return Pattern.compile(regex).matcher(input);
     }
 
-    /** Extracts a string or number field from a JSON body. */
     private String extractField(String json, String field) {
         Matcher m = Pattern.compile("\"" + field + "\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(json);
         if (m.find()) return m.group(1);

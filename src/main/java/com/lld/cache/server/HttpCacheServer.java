@@ -1,9 +1,10 @@
 package com.lld.cache.server;
 
 import com.lld.cache.DistributedCache;
-import com.lld.cache.config.CacheConfig;
-import com.lld.cache.config.ReplicationMode;
-import com.lld.cache.eviction.EvictionPolicyType;
+import com.lld.cache.config.ConfigLoader;
+import com.lld.cache.config.ServerConfig;
+import com.lld.cache.config.ServerRole;
+import com.lld.cache.replication.PrimaryReplicationPublisher;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
@@ -15,39 +16,34 @@ import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
 
-import java.time.Duration;
-
 /**
- * Netty-based HTTP server for the DistributedCache.
+ * Netty HTTP server — entry point for both PRIMARY and REPLICA instances.
  *
- * Run from IntelliJ: set main class to com.lld.cache.server.HttpCacheServer
- * Default port: 8080  (override with --port=<n>)
+ * Usage:
+ *   java -jar distributed-cache.jar                          # uses configuration.yml from classpath
+ *   java -jar distributed-cache.jar --config=my-config.yml  # explicit config file
  *
- * REST API
- * --------
- * GET    /cache/{key}          – get value
- * POST   /cache                – put  body: {"key":"k","value":"v","ttl":60}
- * DELETE /cache/{key}          – delete key
- * GET    /cache/{key}/exists   – check existence
- *
- * GET    /nodes                – list nodes
- * POST   /nodes/{nodeId}       – add node
- * DELETE /nodes/{nodeId}       – remove node
- *
- * GET    /health               – health check
+ * To run a replica:
+ *   java -jar distributed-cache.jar --config=configuration-replica.yml
  */
 public class HttpCacheServer {
 
+    private final ServerConfig serverConfig;
     private final DistributedCache<String, String> cache;
-    private final int port;
+    private final PrimaryReplicationPublisher publisher;
+    private final InternalReplicationHandler internalHandler;
 
-    public HttpCacheServer(DistributedCache<String, String> cache, int port) {
+    public HttpCacheServer(ServerConfig serverConfig,
+                           DistributedCache<String, String> cache,
+                           PrimaryReplicationPublisher publisher,
+                           InternalReplicationHandler internalHandler) {
+        this.serverConfig = serverConfig;
         this.cache = cache;
-        this.port = port;
+        this.publisher = publisher;
+        this.internalHandler = internalHandler;
     }
 
     public void start() throws InterruptedException {
-        // Boss accepts incoming connections; worker handles I/O on accepted channels
         EventLoopGroup bossGroup   = new NioEventLoopGroup(1);
         EventLoopGroup workerGroup = new NioEventLoopGroup();
 
@@ -61,17 +57,19 @@ public class HttpCacheServer {
                         @Override
                         protected void initChannel(SocketChannel ch) {
                             ch.pipeline()
-                              .addLast(new HttpServerCodec())                  // decode req / encode resp
-                              .addLast(new HttpObjectAggregator(512 * 1024))   // aggregate chunked body (max 512 KB)
-                              .addLast(new CacheHttpHandler(cache));            // our routing logic
+                              .addLast(new HttpServerCodec())
+                              .addLast(new HttpObjectAggregator(512 * 1024))
+                              .addLast(new CacheHttpHandler(
+                                      cache,
+                                      serverConfig.getRole(),
+                                      serverConfig.getDefaultTtlSeconds(),
+                                      publisher,
+                                      internalHandler));
                         }
                     });
 
-            ChannelFuture future = bootstrap.bind(port).sync();
-
+            ChannelFuture future = bootstrap.bind(serverConfig.getPort()).sync();
             printBanner();
-
-            // Wait until the server socket is closed
             future.channel().closeFuture().sync();
         } finally {
             bossGroup.shutdownGracefully();
@@ -80,49 +78,74 @@ public class HttpCacheServer {
     }
 
     private void printBanner() {
-        System.out.println("╔══════════════════════════════════════╗");
-        System.out.println("║      Distributed Cache  (Netty)      ║");
-        System.out.println("╚══════════════════════════════════════╝");
-        System.out.printf("Listening on http://localhost:%d%n", port);
-        System.out.println("Active nodes: " + cache.getNodeIds());
-        System.out.println("Press Ctrl+C to stop.\n");
-        System.out.println("Endpoints:");
+        int port = serverConfig.getPort();
+        ServerRole role = serverConfig.getRole();
+
+        System.out.println("╔══════════════════════════════════════════════╗");
+        System.out.printf( "║   Distributed Cache  %-6s  (Netty)        ║%n", role);
+        System.out.println("╚══════════════════════════════════════════════╝");
+        System.out.printf("Listening on  http://localhost:%d%n", port);
+        System.out.printf("Role          %s%n", role);
+        System.out.printf("Active nodes  %s%n", cache.getNodeIds());
+
+        if (role == ServerRole.PRIMARY && !serverConfig.getReplicas().isEmpty()) {
+            System.out.printf("Replicas      %s%n", serverConfig.getReplicas());
+        }
+        if (role == ServerRole.REPLICA && serverConfig.getPrimary() != null) {
+            System.out.printf("Primary       %s%n", serverConfig.getPrimary());
+            System.out.println("Mode          read-only (writes → primary)");
+        }
+
+        System.out.println("\nEndpoints:");
         System.out.printf("  GET    http://localhost:%d/cache/{key}%n", port);
         System.out.printf("  POST   http://localhost:%d/cache          body: {\"key\":\"k\",\"value\":\"v\",\"ttl\":60}%n", port);
         System.out.printf("  DELETE http://localhost:%d/cache/{key}%n", port);
         System.out.printf("  GET    http://localhost:%d/cache/{key}/exists%n", port);
         System.out.printf("  GET    http://localhost:%d/nodes%n", port);
-        System.out.printf("  POST   http://localhost:%d/nodes/{nodeId}%n", port);
-        System.out.printf("  DELETE http://localhost:%d/nodes/{nodeId}%n", port);
         System.out.printf("  GET    http://localhost:%d/health%n", port);
+        System.out.println("\nPress Ctrl+C to stop.");
     }
 
+    // ─── main ───────────────────────────────────────────────────────────────
+
     public static void main(String[] args) throws InterruptedException {
-        int port = 8080;
+        // 1. Resolve config path
+        String configPath = "configuration.yml";
         for (String arg : args) {
-            if (arg.startsWith("--port=")) {
-                port = Integer.parseInt(arg.substring("--port=".length()));
+            if (arg.startsWith("--config=")) {
+                configPath = arg.substring("--config=".length());
             }
         }
 
-        CacheConfig config = new CacheConfig.Builder()
-                .maxEntriesPerNode(10_000)
-                .evictionPolicy(EvictionPolicyType.LRU)
-                .replicationFactor(2)
-                .replicationMode(ReplicationMode.ASYNC)
-                .defaultTtl(Duration.ofHours(1))
-                .build();
+        // 2. Load config
+        ServerConfig serverConfig = ConfigLoader.load(configPath);
+        System.out.printf("Loaded config: %s  (role=%s, port=%d)%n",
+                configPath, serverConfig.getRole(), serverConfig.getPort());
 
-        DistributedCache<String, String> cache = new DistributedCache<>(config);
-        cache.addNode("node-1");
-        cache.addNode("node-2");
-        cache.addNode("node-3");
+        // 3. Build cache
+        DistributedCache<String, String> cache =
+                new DistributedCache<>(ConfigLoader.toCacheConfig(serverConfig));
+        serverConfig.getNodes().forEach(cache::addNode);
 
+        // 4. Wire replication components
+        PrimaryReplicationPublisher publisher = null;
+        if (serverConfig.getRole() == ServerRole.PRIMARY && !serverConfig.getReplicas().isEmpty()) {
+            publisher = new PrimaryReplicationPublisher(serverConfig.getReplicas());
+            System.out.printf("Replication publisher ready → %s%n", serverConfig.getReplicas());
+        }
+
+        InternalReplicationHandler internalHandler =
+                new InternalReplicationHandler(cache, serverConfig.getDefaultTtlSeconds());
+
+        // 5. Shutdown hook
+        final PrimaryReplicationPublisher finalPublisher = publisher;
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\nShutting down cache...");
+            System.out.println("\nShutting down...");
+            if (finalPublisher != null) finalPublisher.shutdown();
             cache.shutdown();
         }));
 
-        new HttpCacheServer(cache, port).start();
+        // 6. Start
+        new HttpCacheServer(serverConfig, cache, publisher, internalHandler).start();
     }
 }

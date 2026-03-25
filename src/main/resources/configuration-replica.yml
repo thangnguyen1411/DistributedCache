@@ -1,0 +1,20 @@
+server:
+  port: 8081
+  role: REPLICA
+
+cache:
+  maxEntriesPerNode: 10000
+  evictionPolicy: LRU
+  defaultTtlSeconds: 3600
+  virtualNodeCount: 150
+  expirationCleanupIntervalSeconds: 1
+
+nodes:
+  - node-1
+  - node-2
+  - node-3
+
+replication:
+  primary:
+    host: localhost
+    port: 8080
