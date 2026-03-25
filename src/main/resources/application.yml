@@ -11,9 +11,10 @@ cache:
   virtualNodeCount: 150
   expirationCleanupIntervalSeconds: 1
 
-replication:
-  replicas:
-    - host: localhost
-      port: 8081
-    - host: localhost
-      port: 8082
+# Replication is opt-in. Uncomment and add replicas to enable it.
+# replication:
+#   replicas:
+#     - host: localhost
+#       port: 8081
+#     - host: localhost
+#       port: 8082
