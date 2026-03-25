@@ -84,9 +84,10 @@ public class HttpCacheServer {
         System.out.println("╔══════════════════════════════════════════════╗");
         System.out.printf( "║   Distributed Cache  %-6s  (Netty)        ║%n", role);
         System.out.println("╚══════════════════════════════════════════════╝");
+        System.out.printf("Server ID     %s%n", serverConfig.getId());
         System.out.printf("Listening on  http://localhost:%d%n", port);
         System.out.printf("Role          %s%n", role);
-        System.out.printf("Active nodes  %s%n", cache.getNodeIds());
+        System.out.printf("Partitions    %s%n", cache.getNodeIds());
 
         if (role == ServerRole.PRIMARY && !serverConfig.getReplicas().isEmpty()) {
             System.out.printf("Replicas      %s%n", serverConfig.getReplicas());
@@ -125,7 +126,7 @@ public class HttpCacheServer {
         // 3. Build cache
         DistributedCache<String, String> cache =
                 new DistributedCache<>(ConfigLoader.toCacheConfig(serverConfig));
-        serverConfig.getNodes().forEach(cache::addNode);
+        serverConfig.generateNodeIds().forEach(cache::addNode);
 
         // 4. Wire replication components
         PrimaryReplicationPublisher publisher = null;

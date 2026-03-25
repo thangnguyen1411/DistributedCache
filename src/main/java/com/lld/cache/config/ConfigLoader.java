@@ -53,6 +53,7 @@ public class ConfigLoader {
 
         // --- server ---
         Map<String, Object> server = section(root, "server");
+        String id    = string(server, "id", "server");
         int port     = integer(server, "port", 8080);
         ServerRole role = ServerRole.valueOf(string(server, "role", "PRIMARY").toUpperCase());
 
@@ -64,9 +65,8 @@ public class ConfigLoader {
         int virtualNodes       = integer(cache, "virtualNodeCount", 150);
         long expiryIntervalSec = longVal(cache, "expirationCleanupIntervalSeconds", 1L);
 
-        // --- nodes ---
-        List<String> nodes = (List<String>) root.getOrDefault("nodes",
-                List.of("node-1", "node-2", "node-3"));
+        // --- node count (names are generated internally, never exposed to users) ---
+        int nodeCount = integer(cache, "nodeCount", 3);
 
         // --- replication ---
         Map<String, Object> replication = section(root, "replication");
@@ -91,8 +91,8 @@ public class ConfigLoader {
         // Validate
         EvictionPolicyType.valueOf(evictionPolicy.toUpperCase()); // throws if unknown
 
-        return new ServerConfig(port, role, maxEntries, evictionPolicy, defaultTtlSec,
-                virtualNodes, expiryIntervalSec, nodes, replicas, primary);
+        return new ServerConfig(id, port, role, maxEntries, evictionPolicy, defaultTtlSec,
+                virtualNodes, expiryIntervalSec, nodeCount, replicas, primary);
     }
 
     /** Converts ServerConfig into the existing CacheConfig used by CacheManager. */
