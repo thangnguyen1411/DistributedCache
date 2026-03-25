@@ -24,7 +24,7 @@ import io.netty.handler.codec.http.HttpServerCodec;
  *   java -jar distributed-cache.jar --config=my-config.yml  # explicit config file
  *
  * To run a replica:
- *   java -jar distributed-cache.jar --config=configuration-replica.yml
+ *   java -jar distributed-cache.jar --config=application-replica.yml
  */
 public class HttpCacheServer {
 
@@ -111,7 +111,7 @@ public class HttpCacheServer {
 
     public static void main(String[] args) throws InterruptedException {
         // 1. Resolve config path
-        String configPath = "configuration.yml";
+        String configPath = "application.yml";
         for (String arg : args) {
             if (arg.startsWith("--config=")) {
                 configPath = arg.substring("--config=".length());

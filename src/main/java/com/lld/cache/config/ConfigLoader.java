@@ -8,6 +8,7 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.InputStream;
 import java.time.Duration;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -17,8 +18,8 @@ import java.util.stream.Collectors;
  * Loads and parses configuration.yml into ServerConfig.
  * Resolution order:
  *   1. Explicit file path (--config=path)
- *   2. ./configuration.yml in current working directory
- *   3. configuration.yml on the classpath
+ *   2. ./application.yml in current working directory
+ *   3. application.yml on the classpath
  */
 public class ConfigLoader {
 
@@ -91,8 +92,10 @@ public class ConfigLoader {
         // Validate
         EvictionPolicyType.valueOf(evictionPolicy.toUpperCase()); // throws if unknown
 
-        return new ServerConfig(id, port, role, maxEntries, evictionPolicy, defaultTtlSec,
+        ServerConfig base = new ServerConfig(id, port, role, maxEntries, evictionPolicy, defaultTtlSec,
                 virtualNodes, expiryIntervalSec, nodeCount, replicas, primary);
+
+        return applyEnvOverrides(base);
     }
 
     /** Converts ServerConfig into the existing CacheConfig used by CacheManager. */
@@ -106,6 +109,67 @@ public class ConfigLoader {
                 .virtualNodeCount(sc.getVirtualNodeCount())
                 .expirationCleanupInterval(Duration.ofSeconds(sc.getExpirationCleanupIntervalSeconds()))
                 .build();
+    }
+
+    // ─── environment variable overrides ─────────────────────────────────────
+    //
+    // Env vars take precedence over the YAML file.
+    // This is the standard pattern for Docker / AWS ECS / Kubernetes.
+    //
+    // Supported variables:
+    //   CACHE_SERVER_ID       overrides server.id
+    //   CACHE_SERVER_PORT     overrides server.port
+    //   CACHE_SERVER_ROLE     overrides server.role  (PRIMARY or REPLICA)
+    //   CACHE_NODE_COUNT      overrides cache.nodeCount
+    //   CACHE_REPLICAS        overrides replication.replicas  format: host:port,host:port
+    //   CACHE_PRIMARY         overrides replication.primary   format: host:port
+
+    private static ServerConfig applyEnvOverrides(ServerConfig c) {
+        String id     = envOr("CACHE_SERVER_ID",   c.getId());
+        int port      = intEnvOr("CACHE_SERVER_PORT", c.getPort());
+        ServerRole role = c.getRole();
+        String roleEnv = System.getenv("CACHE_SERVER_ROLE");
+        if (roleEnv != null) role = ServerRole.valueOf(roleEnv.toUpperCase());
+
+        int nodeCount = intEnvOr("CACHE_NODE_COUNT", c.getNodeCount());
+
+        List<NodeAddress> replicas = c.getReplicas();
+        String replicasEnv = System.getenv("CACHE_REPLICAS");
+        if (replicasEnv != null && !replicasEnv.isBlank()) {
+            replicas = Arrays.stream(replicasEnv.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .map(ConfigLoader::parseAddress)
+                    .collect(Collectors.toList());
+        }
+
+        NodeAddress primary = c.getPrimary();
+        String primaryEnv = System.getenv("CACHE_PRIMARY");
+        if (primaryEnv != null && !primaryEnv.isBlank()) {
+            primary = parseAddress(primaryEnv.trim());
+        }
+
+        return new ServerConfig(id, port, role, c.getMaxEntriesPerNode(), c.getEvictionPolicy(),
+                c.getDefaultTtlSeconds(), c.getVirtualNodeCount(),
+                c.getExpirationCleanupIntervalSeconds(), nodeCount, replicas, primary);
+    }
+
+    private static NodeAddress parseAddress(String hostPort) {
+        String[] parts = hostPort.split(":");
+        if (parts.length != 2) {
+            throw new InvalidConfigException("Invalid address format (expected host:port): " + hostPort);
+        }
+        return new NodeAddress(parts[0], Integer.parseInt(parts[1]));
+    }
+
+    private static String envOr(String envKey, String fallback) {
+        String v = System.getenv(envKey);
+        return (v != null && !v.isBlank()) ? v : fallback;
+    }
+
+    private static int intEnvOr(String envKey, int fallback) {
+        String v = System.getenv(envKey);
+        return (v != null && !v.isBlank()) ? Integer.parseInt(v) : fallback;
     }
 
     // ─── helpers ────────────────────────────────────────────────────────────
